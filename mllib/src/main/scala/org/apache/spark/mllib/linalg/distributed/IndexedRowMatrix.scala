@@ -19,20 +19,18 @@ package org.apache.spark.mllib.linalg.distributed
 
 import breeze.linalg.{DenseMatrix => BDM}
 
-import org.apache.spark.annotation.Experimental
-import org.apache.spark.rdd.RDD
+import org.apache.spark.annotation.Since
 import org.apache.spark.mllib.linalg._
 import org.apache.spark.mllib.linalg.SingularValueDecomposition
+import org.apache.spark.rdd.RDD
 
 /**
- * :: Experimental ::
  * Represents a row of [[org.apache.spark.mllib.linalg.distributed.IndexedRowMatrix]].
  */
-@Experimental
+@Since("1.0.0")
 case class IndexedRow(index: Long, vector: Vector)
 
 /**
- * :: Experimental ::
  * Represents a row-oriented [[org.apache.spark.mllib.linalg.distributed.DistributedMatrix]] with
  * indexed rows.
  *
@@ -42,15 +40,17 @@ case class IndexedRow(index: Long, vector: Vector)
  * @param nCols number of columns. A non-positive value means unknown, and then the number of
  *              columns will be determined by the size of the first row.
  */
-@Experimental
-class IndexedRowMatrix(
-    val rows: RDD[IndexedRow],
+@Since("1.0.0")
+class IndexedRowMatrix @Since("1.0.0") (
+    @Since("1.0.0") val rows: RDD[IndexedRow],
     private var nRows: Long,
     private var nCols: Int) extends DistributedMatrix {
 
   /** Alternative constructor leaving matrix dimensions to be determined automatically. */
+  @Since("1.0.0")
   def this(rows: RDD[IndexedRow]) = this(rows, 0L, 0)
 
+  @Since("1.0.0")
   override def numCols(): Long = {
     if (nCols <= 0) {
       // Calling `first` will throw an exception if `rows` is empty.
@@ -59,6 +59,7 @@ class IndexedRowMatrix(
     nCols
   }
 
+  @Since("1.0.0")
   override def numRows(): Long = {
     if (nRows <= 0L) {
       // Reduce will throw an exception if `rows` is empty.
@@ -67,25 +68,137 @@ class IndexedRowMatrix(
     nRows
   }
 
+
+  /**
+   * Compute all cosine similarities between columns of this matrix using the brute-force
+   * approach of computing normalized dot products.
+   *
+   * @return An n x n sparse upper-triangular matrix of cosine similarities between
+   *         columns of this matrix.
+   */
+  @Since("1.6.0")
+  def columnSimilarities(): CoordinateMatrix = {
+    toRowMatrix().columnSimilarities()
+  }
+
   /**
    * Drops row indices and converts this matrix to a
    * [[org.apache.spark.mllib.linalg.distributed.RowMatrix]].
    */
+  @Since("1.0.0")
   def toRowMatrix(): RowMatrix = {
     new RowMatrix(rows.map(_.vector), 0L, nCols)
   }
 
   /**
-   * Computes the singular value decomposition of this matrix.
+   * Converts to BlockMatrix. Creates blocks with size 1024 x 1024.
+   */
+  @Since("1.3.0")
+  def toBlockMatrix(): BlockMatrix = {
+    toBlockMatrix(1024, 1024)
+  }
+
+  /**
+   * Converts to BlockMatrix. Blocks may be sparse or dense depending on the sparsity of the rows.
+   * @param rowsPerBlock The number of rows of each block. The blocks at the bottom edge may have
+   *                     a smaller value. Must be an integer value greater than 0.
+   * @param colsPerBlock The number of columns of each block. The blocks at the right edge may have
+   *                     a smaller value. Must be an integer value greater than 0.
+   * @return a [[BlockMatrix]]
+   */
+  @Since("1.3.0")
+  def toBlockMatrix(rowsPerBlock: Int, colsPerBlock: Int): BlockMatrix = {
+    require(rowsPerBlock > 0,
+      s"rowsPerBlock needs to be greater than 0. rowsPerBlock: $rowsPerBlock")
+    require(colsPerBlock > 0,
+      s"colsPerBlock needs to be greater than 0. colsPerBlock: $colsPerBlock")
+
+    val m = numRows()
+    val n = numCols()
+
+    // Since block matrices require an integer row index
+    require(math.ceil(m.toDouble / rowsPerBlock) <= Int.MaxValue,
+      "Number of rows divided by rowsPerBlock cannot exceed maximum integer.")
+
+    // The remainder calculations only matter when m % rowsPerBlock != 0 or n % colsPerBlock != 0
+    val remainderRowBlockIndex = m / rowsPerBlock
+    val remainderColBlockIndex = n / colsPerBlock
+    val remainderRowBlockSize = (m % rowsPerBlock).toInt
+    val remainderColBlockSize = (n % colsPerBlock).toInt
+    val numRowBlocks = math.ceil(m.toDouble / rowsPerBlock).toInt
+    val numColBlocks = math.ceil(n.toDouble / colsPerBlock).toInt
+
+    val blocks = rows.flatMap { ir: IndexedRow =>
+      val blockRow = ir.index / rowsPerBlock
+      val rowInBlock = ir.index % rowsPerBlock
+
+      ir.vector match {
+        case SparseVector(size, indices, values) =>
+          indices.zip(values).map { case (index, value) =>
+            val blockColumn = index / colsPerBlock
+            val columnInBlock = index % colsPerBlock
+            ((blockRow.toInt, blockColumn.toInt), (rowInBlock.toInt, Array((value, columnInBlock))))
+          }
+        case DenseVector(values) =>
+          values.grouped(colsPerBlock)
+            .zipWithIndex
+            .map { case (values, blockColumn) =>
+              ((blockRow.toInt, blockColumn), (rowInBlock.toInt, values.zipWithIndex))
+            }
+      }
+    }.groupByKey(GridPartitioner(numRowBlocks, numColBlocks, rows.getNumPartitions)).map {
+      case ((blockRow, blockColumn), itr) =>
+        val actualNumRows =
+          if (blockRow == remainderRowBlockIndex) remainderRowBlockSize else rowsPerBlock
+        val actualNumColumns =
+          if (blockColumn == remainderColBlockIndex) remainderColBlockSize else colsPerBlock
+
+        val arraySize = actualNumRows * actualNumColumns
+        val matrixAsArray = new Array[Double](arraySize)
+        var countForValues = 0
+        itr.foreach { case (rowWithinBlock, valuesWithColumns) =>
+          valuesWithColumns.foreach { case (value, columnWithinBlock) =>
+            matrixAsArray.update(columnWithinBlock * actualNumRows + rowWithinBlock, value)
+            countForValues += 1
+          }
+        }
+        val denseMatrix = new DenseMatrix(actualNumRows, actualNumColumns, matrixAsArray)
+        val finalMatrix = if (countForValues / arraySize.toDouble >= 0.1) {
+          denseMatrix
+        } else {
+          denseMatrix.toSparse
+        }
+
+        ((blockRow, blockColumn), finalMatrix)
+    }
+    new BlockMatrix(blocks, rowsPerBlock, colsPerBlock, m, n)
+  }
+
+  /**
+   * Converts this matrix to a
+   * [[org.apache.spark.mllib.linalg.distributed.CoordinateMatrix]].
+   */
+  @Since("1.3.0")
+  def toCoordinateMatrix(): CoordinateMatrix = {
+    val entries = rows.flatMap { row =>
+      val rowIndex = row.index
+      row.vector match {
+        case SparseVector(size, indices, values) =>
+          Iterator.tabulate(indices.length)(i => MatrixEntry(rowIndex, indices(i), values(i)))
+        case DenseVector(values) =>
+          Iterator.tabulate(values.length)(i => MatrixEntry(rowIndex, i, values(i)))
+      }
+    }
+    new CoordinateMatrix(entries, numRows(), numCols())
+  }
+
+  /**
+   * Computes the singular value decomposition of this IndexedRowMatrix.
    * Denote this matrix by A (m x n), this will compute matrices U, S, V such that A = U * S * V'.
    *
-   * There is no restriction on m, but we require `n^2` doubles to fit in memory.
-   * Further, n should be less than m.
-
-   * The decomposition is computed by first computing A'A = V S^2 V',
-   * computing svd locally on that (since n x n is small), from which we recover S and V.
-   * Then we compute U via easy matrix multiplication as U =  A * (V * S^-1).
-   * Note that this approach requires `O(n^3)` time on the master node.
+   * The cost and implementation of this method is identical to that in
+   * [[org.apache.spark.mllib.linalg.distributed.RowMatrix]]
+   * With the addition of indices.
    *
    * At most k largest non-zero singular values and associated vectors are returned.
    * If there are k such values, then the dimensions of the return will be:
@@ -102,17 +215,21 @@ class IndexedRowMatrix(
    *              are treated as zero, where sigma(0) is the largest singular value.
    * @return SingularValueDecomposition(U, s, V)
    */
+  @Since("1.0.0")
   def computeSVD(
       k: Int,
       computeU: Boolean = false,
       rCond: Double = 1e-9): SingularValueDecomposition[IndexedRowMatrix, Matrix] = {
+
+    val n = numCols().toInt
+    require(k > 0 && k <= n, s"Requested k singular values but got k=$k and numCols=$n.")
     val indices = rows.map(_.index)
     val svd = toRowMatrix().computeSVD(k, computeU, rCond)
     val U = if (computeU) {
       val indexedRows = indices.zip(svd.U.rows).map { case (i, v) =>
         IndexedRow(i, v)
       }
-      new IndexedRowMatrix(indexedRows, nRows, nCols)
+      new IndexedRowMatrix(indexedRows, nRows, svd.U.numCols().toInt)
     } else {
       null
     }
@@ -125,17 +242,21 @@ class IndexedRowMatrix(
    * @param B a local matrix whose number of rows must match the number of columns of this matrix
    * @return an IndexedRowMatrix representing the product, which preserves partitioning
    */
+  @Since("1.0.0")
   def multiply(B: Matrix): IndexedRowMatrix = {
     val mat = toRowMatrix().multiply(B)
     val indexedRows = rows.map(_.index).zip(mat.rows).map { case (i, v) =>
       IndexedRow(i, v)
     }
-    new IndexedRowMatrix(indexedRows, nRows, nCols)
+    new IndexedRowMatrix(indexedRows, nRows, B.numCols)
   }
 
   /**
    * Computes the Gramian matrix `A^T A`.
+   *
+   * @note This cannot be computed on matrices with more than 65535 columns.
    */
+  @Since("1.0.0")
   def computeGramianMatrix(): Matrix = {
     toRowMatrix().computeGramianMatrix()
   }
@@ -146,7 +267,7 @@ class IndexedRowMatrix(
     val mat = BDM.zeros[Double](m, n)
     rows.collect().foreach { case IndexedRow(rowIndex, vector) =>
       val i = rowIndex.toInt
-      vector.toBreeze.activeIterator.foreach { case (j, v) =>
+      vector.foreachActive { case (j, v) =>
         mat(i, j) = v
       }
     }

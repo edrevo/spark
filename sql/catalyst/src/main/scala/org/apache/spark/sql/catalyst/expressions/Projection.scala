@@ -17,49 +17,82 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.codegen.{GenerateSafeProjection, GenerateUnsafeProjection}
+import org.apache.spark.sql.types.{DataType, StructType}
+
 /**
- * Converts a [[Row]] to another Row given a sequence of expression that define each column of the
- * new row. If the schema of the input row is specified, then the given expression will be bound to
- * that schema.
+ * A [[Projection]] that is calculated by calling the `eval` of each of the specified expressions.
+ *
+ * @param expressions a sequence of expressions that determine the value of each column of the
+ *                    output row.
  */
-class Projection(expressions: Seq[Expression]) extends (Row => Row) {
+class InterpretedProjection(expressions: Seq[Expression]) extends Projection {
   def this(expressions: Seq[Expression], inputSchema: Seq[Attribute]) =
     this(expressions.map(BindReferences.bindReference(_, inputSchema)))
 
-  protected val exprArray = expressions.toArray
+  override def initialize(partitionIndex: Int): Unit = {
+    expressions.foreach(_.foreach {
+      case n: Nondeterministic => n.initialize(partitionIndex)
+      case _ =>
+    })
+  }
 
-  def apply(input: Row): Row = {
+  // null check is required for when Kryo invokes the no-arg constructor.
+  protected val exprArray = if (expressions != null) expressions.toArray else null
+
+  def apply(input: InternalRow): InternalRow = {
     val outputArray = new Array[Any](exprArray.length)
     var i = 0
     while (i < exprArray.length) {
       outputArray(i) = exprArray(i).eval(input)
       i += 1
     }
-    new GenericRow(outputArray)
+    new GenericInternalRow(outputArray)
   }
+
+  override def toString(): String = s"Row => [${exprArray.mkString(",")}]"
 }
 
 /**
- * Converts a [[Row]] to another Row given a sequence of expression that define each column of th
- * new row. If the schema of the input row is specified, then the given expression will be bound to
- * that schema.
+ * A [[MutableProjection]] that is calculated by calling `eval` on each of the specified
+ * expressions.
  *
- * In contrast to a normal projection, a MutableProjection reuses the same underlying row object
- * each time an input row is added.  This significatly reduces the cost of calcuating the
- * projection, but means that it is not safe
+ * @param expressions a sequence of expressions that determine the value of each column of the
+ *                    output row.
  */
-case class MutableProjection(expressions: Seq[Expression]) extends (Row => Row) {
+case class InterpretedMutableProjection(expressions: Seq[Expression]) extends MutableProjection {
   def this(expressions: Seq[Expression], inputSchema: Seq[Attribute]) =
     this(expressions.map(BindReferences.bindReference(_, inputSchema)))
 
-  private[this] val exprArray = expressions.toArray
-  private[this] val mutableRow = new GenericMutableRow(exprArray.size)
-  def currentValue: Row = mutableRow
+  private[this] val buffer = new Array[Any](expressions.size)
 
-  def apply(input: Row): Row = {
+  override def initialize(partitionIndex: Int): Unit = {
+    expressions.foreach(_.foreach {
+      case n: Nondeterministic => n.initialize(partitionIndex)
+      case _ =>
+    })
+  }
+
+  private[this] val exprArray = expressions.toArray
+  private[this] var mutableRow: InternalRow = new GenericInternalRow(exprArray.length)
+  def currentValue: InternalRow = mutableRow
+
+  override def target(row: InternalRow): MutableProjection = {
+    mutableRow = row
+    this
+  }
+
+  override def apply(input: InternalRow): InternalRow = {
     var i = 0
     while (i < exprArray.length) {
-      mutableRow(i) = exprArray(i).eval(input)
+      // Store the result into buffer first, to make the projection atomic (needed by aggregation)
+      buffer(i) = exprArray(i).eval(input)
+      i += 1
+    }
+    i = 0
+    while (i < exprArray.length) {
+      mutableRow(i) = buffer(i)
       i += 1
     }
     mutableRow
@@ -67,78 +100,85 @@ case class MutableProjection(expressions: Seq[Expression]) extends (Row => Row) 
 }
 
 /**
- * A mutable wrapper that makes two rows appear appear as a single concatenated row.  Designed to
- * be instantiated once per thread and reused.
+ * A projection that returns UnsafeRow.
  */
-class JoinedRow extends Row {
-  private[this] var row1: Row = _
-  private[this] var row2: Row = _
+abstract class UnsafeProjection extends Projection {
+  override def apply(row: InternalRow): UnsafeRow
+}
 
-  /** Updates this JoinedRow to used point at two new base rows.  Returns itself. */
-  def apply(r1: Row, r2: Row): Row = {
-    row1 = r1
-    row2 = r2
-    this
+object UnsafeProjection {
+
+  /**
+   * Returns an UnsafeProjection for given StructType.
+   */
+  def create(schema: StructType): UnsafeProjection = create(schema.fields.map(_.dataType))
+
+  /**
+   * Returns an UnsafeProjection for given Array of DataTypes.
+   */
+  def create(fields: Array[DataType]): UnsafeProjection = {
+    create(fields.zipWithIndex.map(x => BoundReference(x._2, x._1, true)))
   }
 
-  /** Updates this JoinedRow by updating its left base row.  Returns itself. */
-  def withLeft(newLeft: Row): Row = {
-    row1 = newLeft
-    this
+  /**
+   * Returns an UnsafeProjection for given sequence of Expressions (bounded).
+   */
+  def create(exprs: Seq[Expression]): UnsafeProjection = {
+    val unsafeExprs = exprs.map(_ transform {
+      case CreateNamedStruct(children) => CreateNamedStructUnsafe(children)
+    })
+    GenerateUnsafeProjection.generate(unsafeExprs)
   }
 
-  /** Updates this JoinedRow by updating its right base row.  Returns itself. */
-  def withRight(newRight: Row): Row = {
-    row2 = newRight
-    this
+  def create(expr: Expression): UnsafeProjection = create(Seq(expr))
+
+  /**
+   * Returns an UnsafeProjection for given sequence of Expressions, which will be bound to
+   * `inputSchema`.
+   */
+  def create(exprs: Seq[Expression], inputSchema: Seq[Attribute]): UnsafeProjection = {
+    create(exprs.map(BindReferences.bindReference(_, inputSchema)))
   }
 
-  def iterator = row1.iterator ++ row2.iterator
+  /**
+   * Same as other create()'s but allowing enabling/disabling subexpression elimination.
+   * TODO: refactor the plumbing and clean this up.
+   */
+  def create(
+      exprs: Seq[Expression],
+      inputSchema: Seq[Attribute],
+      subexpressionEliminationEnabled: Boolean): UnsafeProjection = {
+    val e = exprs.map(BindReferences.bindReference(_, inputSchema))
+      .map(_ transform {
+        case CreateNamedStruct(children) => CreateNamedStructUnsafe(children)
+    })
+    GenerateUnsafeProjection.generate(e, subexpressionEliminationEnabled)
+  }
+}
 
-  def length = row1.length + row2.length
+/**
+ * A projection that could turn UnsafeRow into GenericInternalRow
+ */
+object FromUnsafeProjection {
 
-  def apply(i: Int) =
-    if (i < row1.size) row1(i) else row2(i - row1.size)
-
-  def isNullAt(i: Int) = apply(i) == null
-
-  def getInt(i: Int): Int =
-    if (i < row1.size) row1.getInt(i) else row2.getInt(i - row1.size)
-
-  def getLong(i: Int): Long =
-    if (i < row1.size) row1.getLong(i) else row2.getLong(i - row1.size)
-
-  def getDouble(i: Int): Double =
-    if (i < row1.size) row1.getDouble(i) else row2.getDouble(i - row1.size)
-
-  def getBoolean(i: Int): Boolean =
-    if (i < row1.size) row1.getBoolean(i) else row2.getBoolean(i - row1.size)
-
-  def getShort(i: Int): Short =
-    if (i < row1.size) row1.getShort(i) else row2.getShort(i - row1.size)
-
-  def getByte(i: Int): Byte =
-    if (i < row1.size) row1.getByte(i) else row2.getByte(i - row1.size)
-
-  def getFloat(i: Int): Float =
-    if (i < row1.size) row1.getFloat(i) else row2.getFloat(i - row1.size)
-
-  def getString(i: Int): String =
-    if (i < row1.size) row1.getString(i) else row2.getString(i - row1.size)
-
-  def copy() = {
-    val totalSize = row1.size + row2.size
-    val copiedValues = new Array[Any](totalSize)
-    var i = 0
-    while(i < totalSize) {
-      copiedValues(i) = apply(i)
-      i += 1
-    }
-    new GenericRow(copiedValues)
+  /**
+   * Returns a Projection for given StructType.
+   */
+  def apply(schema: StructType): Projection = {
+    apply(schema.fields.map(_.dataType))
   }
 
-  override def toString() = {
-    val row = (if (row1 != null) row1 else Seq[Any]()) ++ (if (row2 != null) row2 else Seq[Any]())
-    s"[${row.mkString(",")}]"
+  /**
+   * Returns an UnsafeProjection for given Array of DataTypes.
+   */
+  def apply(fields: Seq[DataType]): Projection = {
+    create(fields.zipWithIndex.map(x => new BoundReference(x._2, x._1, true)))
+  }
+
+  /**
+   * Returns a Projection for given sequence of Expressions (bounded).
+   */
+  private def create(exprs: Seq[Expression]): Projection = {
+    GenerateSafeProjection.generate(exprs)
   }
 }

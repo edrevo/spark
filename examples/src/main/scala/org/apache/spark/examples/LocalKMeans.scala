@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+// scalastyle:off println
 package org.apache.spark.examples
 
 import java.util.Random
@@ -22,12 +23,13 @@ import java.util.Random
 import scala.collection.mutable.HashMap
 import scala.collection.mutable.HashSet
 
-import breeze.linalg.{Vector, DenseVector, squaredDistance}
-
-import org.apache.spark.SparkContext._
+import breeze.linalg.{squaredDistance, DenseVector, Vector}
 
 /**
  * K-means clustering.
+ *
+ * This is an example implementation for learning how to use Spark. For more conventional use,
+ * please refer to org.apache.spark.ml.clustering.KMeans.
  */
 object LocalKMeans {
   val N = 1000
@@ -37,9 +39,9 @@ object LocalKMeans {
   val convergeDist = 0.001
   val rand = new Random(42)
 
-  def generateData = {
-    def generatePoint(i: Int) = {
-      DenseVector.fill(D){rand.nextDouble * R}
+  def generateData: Array[DenseVector[Double]] = {
+    def generatePoint(i: Int): DenseVector[Double] = {
+      DenseVector.fill(D) {rand.nextDouble * R}
     }
     Array.tabulate(N)(generatePoint)
   }
@@ -61,7 +63,18 @@ object LocalKMeans {
     bestIndex
   }
 
+  def showWarning() {
+    System.err.println(
+      """WARN: This is a naive implementation of KMeans Clustering and is given as an example!
+        |Please use org.apache.spark.ml.clustering.KMeans
+        |for more conventional use.
+      """.stripMargin)
+  }
+
   def main(args: Array[String]) {
+
+    showWarning()
+
     val data = generateData
     var points = new HashSet[Vector[Double]]
     var kPoints = new HashMap[Int, Vector[Double]]
@@ -85,7 +98,7 @@ object LocalKMeans {
 
       var pointStats = mappings.map { pair =>
         pair._2.reduceLeft [(Int, (Vector[Double], Int))] {
-          case ((id1, (x1, y1)), (id2, (x2, y2))) => (id1, (x1 + x2, y1 + y2))
+          case ((id1, (p1, c1)), (id2, (p2, c2))) => (id1, (p1 + p2, c1 + c2))
         }
       }
 
@@ -105,3 +118,4 @@ object LocalKMeans {
     println("Final centers: " + kPoints)
   }
 }
+// scalastyle:on println

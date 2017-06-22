@@ -15,23 +15,33 @@
  * limitations under the License.
  */
 
+// scalastyle:off println
 package org.apache.spark.examples
 
-import org.apache.spark._
+import org.apache.spark.sql.SparkSession
+
 
 object HdfsTest {
+
+  /** Usage: HdfsTest [file] */
   def main(args: Array[String]) {
-    val sparkConf = new SparkConf().setAppName("HdfsTest")
-    val sc = new SparkContext(sparkConf)
-    val file = sc.textFile(args(1))
+    if (args.length < 1) {
+      System.err.println("Usage: HdfsTest <file>")
+      System.exit(1)
+    }
+    val spark = SparkSession
+      .builder
+      .appName("HdfsTest")
+      .getOrCreate()
+    val file = spark.read.text(args(0)).rdd
     val mapped = file.map(s => s.length).cache()
     for (iter <- 1 to 10) {
       val start = System.currentTimeMillis()
       for (x <- mapped) { x + 2 }
-      //  println("Processing: " + x)
       val end = System.currentTimeMillis()
       println("Iteration " + iter + " took " + (end-start) + " ms")
     }
-    sc.stop()
+    spark.stop()
   }
 }
+// scalastyle:on println

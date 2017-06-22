@@ -17,10 +17,45 @@
 
 package org.apache.spark.util.random
 
-import org.apache.commons.math3.distribution.{BinomialDistribution, PoissonDistribution}
-import org.scalatest.FunSuite
+import scala.util.Random
 
-class SamplingUtilsSuite extends FunSuite {
+import org.apache.commons.math3.distribution.{BinomialDistribution, PoissonDistribution}
+
+import org.apache.spark.SparkFunSuite
+
+class SamplingUtilsSuite extends SparkFunSuite {
+
+  test("reservoirSampleAndCount") {
+    val input = Seq.fill(100)(Random.nextInt())
+
+    // input size < k
+    val (sample1, count1) = SamplingUtils.reservoirSampleAndCount(input.iterator, 150)
+    assert(count1 === 100)
+    assert(input === sample1.toSeq)
+
+    // input size == k
+    val (sample2, count2) = SamplingUtils.reservoirSampleAndCount(input.iterator, 100)
+    assert(count2 === 100)
+    assert(input === sample2.toSeq)
+
+    // input size > k
+    val (sample3, count3) = SamplingUtils.reservoirSampleAndCount(input.iterator, 10)
+    assert(count3 === 100)
+    assert(sample3.length === 10)
+  }
+
+  test("SPARK-18678 reservoirSampleAndCount with tiny input") {
+    val input = Seq(0, 1)
+    val counts = new Array[Int](input.size)
+    for (i <- 0 until 500) {
+      val (samples, inputSize) = SamplingUtils.reservoirSampleAndCount(input.iterator, 1)
+      assert(inputSize === 2)
+      assert(samples.length === 1)
+      counts(samples.head) += 1
+    }
+    // If correct, should be true with prob ~ 0.99999707
+    assert(math.abs(counts(0) - counts(1)) <= 100)
+  }
 
   test("computeFraction") {
     // test that the computed fraction guarantees enough data points

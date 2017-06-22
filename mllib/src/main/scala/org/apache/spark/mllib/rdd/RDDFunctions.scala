@@ -20,35 +20,46 @@ package org.apache.spark.mllib.rdd
 import scala.language.implicitConversions
 import scala.reflect.ClassTag
 
+import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.rdd.RDD
 
 /**
+ * :: DeveloperApi ::
  * Machine learning specific RDD functions.
  */
-private[mllib]
-class RDDFunctions[T: ClassTag](self: RDD[T]) {
+@DeveloperApi
+class RDDFunctions[T: ClassTag](self: RDD[T]) extends Serializable {
 
   /**
-   * Returns a RDD from grouping items of its parent RDD in fixed size blocks by passing a sliding
+   * Returns an RDD from grouping items of its parent RDD in fixed size blocks by passing a sliding
    * window over them. The ordering is first based on the partition index and then the ordering of
    * items within each partition. This is similar to sliding in Scala collections, except that it
    * becomes an empty RDD if the window size is greater than the total number of items. It needs to
    * trigger a Spark job if the parent RDD has more than one partitions and the window size is
    * greater than 1.
    */
-  def sliding(windowSize: Int): RDD[Seq[T]] = {
+  def sliding(windowSize: Int, step: Int): RDD[Array[T]] = {
     require(windowSize > 0, s"Sliding window size must be positive, but got $windowSize.")
-    if (windowSize == 1) {
-      self.map(Seq(_))
+    if (windowSize == 1 && step == 1) {
+      self.map(Array(_))
     } else {
-      new SlidingRDD[T](self, windowSize)
+      new SlidingRDD[T](self, windowSize, step)
     }
   }
+
+  /**
+   * `sliding(Int, Int)*` with step = 1.
+   */
+  def sliding(windowSize: Int): RDD[Array[T]] = sliding(windowSize, 1)
+
 }
 
-private[mllib]
+/**
+ * :: DeveloperApi ::
+ */
+@DeveloperApi
 object RDDFunctions {
 
   /** Implicit conversion from an RDD to RDDFunctions. */
-  implicit def fromRDD[T: ClassTag](rdd: RDD[T]) = new RDDFunctions[T](rdd)
+  implicit def fromRDD[T: ClassTag](rdd: RDD[T]): RDDFunctions[T] = new RDDFunctions[T](rdd)
 }

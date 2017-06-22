@@ -20,24 +20,25 @@ package org.apache.spark.deploy.worker.ui
 import java.io.File
 import javax.servlet.http.HttpServletRequest
 
-import org.apache.spark.{Logging, SparkConf}
 import org.apache.spark.deploy.worker.Worker
+import org.apache.spark.internal.Logging
 import org.apache.spark.ui.{SparkUI, WebUI}
 import org.apache.spark.ui.JettyUtils._
-import org.apache.spark.util.AkkaUtils
+import org.apache.spark.util.RpcUtils
 
 /**
  * Web UI server for the standalone worker.
  */
-private[spark]
+private[worker]
 class WorkerWebUI(
     val worker: Worker,
     val workDir: File,
-    port: Option[Int] = None)
-  extends WebUI(worker.securityMgr, WorkerWebUI.getUIPort(port, worker.conf), worker.conf)
+    requestedPort: Int)
+  extends WebUI(worker.securityMgr, worker.securityMgr.getSSLOptions("standalone"),
+    requestedPort, worker.conf, name = "WorkerUI")
   with Logging {
 
-  val timeout = AkkaUtils.askTimeout(worker.conf)
+  private[ui] val timeout = RpcUtils.askRpcTimeout(worker.conf)
 
   initialize()
 
@@ -48,16 +49,14 @@ class WorkerWebUI(
     attachPage(new WorkerPage(this))
     attachHandler(createStaticHandler(WorkerWebUI.STATIC_RESOURCE_BASE, "/static"))
     attachHandler(createServletHandler("/log",
-      (request: HttpServletRequest) => logPage.renderLog(request), worker.securityMgr))
-    worker.metricsSystem.getServletHandlers.foreach(attachHandler)
+      (request: HttpServletRequest) => logPage.renderLog(request),
+      worker.securityMgr,
+      worker.conf))
   }
 }
 
-private[spark] object WorkerWebUI {
-  val DEFAULT_PORT = 8081
+private[worker] object WorkerWebUI {
   val STATIC_RESOURCE_BASE = SparkUI.STATIC_RESOURCE_DIR
-
-  def getUIPort(requestedPort: Option[Int], conf: SparkConf): Int = {
-    requestedPort.getOrElse(conf.getInt("worker.ui.port", WorkerWebUI.DEFAULT_PORT))
-  }
+  val DEFAULT_RETAINED_DRIVERS = 1000
+  val DEFAULT_RETAINED_EXECUTORS = 1000
 }

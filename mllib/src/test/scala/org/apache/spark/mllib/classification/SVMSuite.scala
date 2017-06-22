@@ -17,17 +17,16 @@
 
 package org.apache.spark.mllib.classification
 
+import scala.collection.JavaConverters._
 import scala.util.Random
-import scala.collection.JavaConversions._
 
-import org.scalatest.FunSuite
+import breeze.linalg.{DenseVector => BDV}
 
-import org.jblas.DoubleMatrix
-
-import org.apache.spark.SparkException
-import org.apache.spark.mllib.regression._
-import org.apache.spark.mllib.util.LocalSparkContext
+import org.apache.spark.{SparkException, SparkFunSuite}
 import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.regression._
+import org.apache.spark.mllib.util.{LocalClusterSparkContext, MLlibTestSparkContext}
+import org.apache.spark.util.Utils
 
 object SVMSuite {
 
@@ -36,7 +35,7 @@ object SVMSuite {
     weights: Array[Double],
     nPoints: Int,
     seed: Int): java.util.List[LabeledPoint] = {
-    seqAsJavaList(generateSVMInput(intercept, weights, nPoints, seed))
+    generateSVMInput(intercept, weights, nPoints, seed).asJava
   }
 
   // Generate noisy input of the form Y = signum(x.dot(weights) + intercept + noise)
@@ -46,20 +45,22 @@ object SVMSuite {
     nPoints: Int,
     seed: Int): Seq[LabeledPoint] = {
     val rnd = new Random(seed)
-    val weightsMat = new DoubleMatrix(1, weights.length, weights:_*)
+    val weightsMat = new BDV(weights)
     val x = Array.fill[Array[Double]](nPoints)(
         Array.fill[Double](weights.length)(rnd.nextDouble() * 2.0 - 1.0))
     val y = x.map { xi =>
-      val yD = new DoubleMatrix(1, xi.length, xi: _*).dot(weightsMat) +
-        intercept + 0.01 * rnd.nextGaussian()
+      val yD = new BDV(xi).dot(weightsMat) + intercept + 0.01 * rnd.nextGaussian()
       if (yD < 0) 0.0 else 1.0
     }
     y.zip(x).map(p => LabeledPoint(p._1, Vectors.dense(p._2)))
   }
 
+  /** Binary labels, 3 features */
+  private val binaryModel = new SVMModel(weights = Vectors.dense(0.1, 0.2, 0.3), intercept = 0.5)
+
 }
 
-class SVMSuite extends FunSuite with LocalSparkContext {
+class SVMSuite extends SparkFunSuite with MLlibTestSparkContext {
 
   def validatePrediction(predictions: Seq[Double], input: Seq[LabeledPoint]) {
     val numOffPredictions = predictions.zip(input).count { case (prediction, expected) =>
@@ -88,7 +89,7 @@ class SVMSuite extends FunSuite with LocalSparkContext {
     val model = svm.run(testRDD)
 
     val validationData = SVMSuite.generateSVMInput(A, Array[Double](B, C), nPoints, 17)
-    val validationRDD  = sc.parallelize(validationData, 2)
+    val validationRDD = sc.parallelize(validationData, 2)
 
     // Test prediction on RDD.
 
@@ -114,7 +115,7 @@ class SVMSuite extends FunSuite with LocalSparkContext {
     val B = -1.5
     val C = 1.0
 
-    val testData = SVMSuite.generateSVMInput(A, Array[Double](B,C), nPoints, 42)
+    val testData = SVMSuite.generateSVMInput(A, Array[Double](B, C), nPoints, 42)
 
     val testRDD = sc.parallelize(testData, 2)
     testRDD.cache()
@@ -124,8 +125,8 @@ class SVMSuite extends FunSuite with LocalSparkContext {
 
     val model = svm.run(testRDD)
 
-    val validationData = SVMSuite.generateSVMInput(A, Array[Double](B,C), nPoints, 17)
-    val validationRDD  = sc.parallelize(validationData, 2)
+    val validationData = SVMSuite.generateSVMInput(A, Array[Double](B, C), nPoints, 17)
+    val validationRDD = sc.parallelize(validationData, 2)
 
     // Test prediction on RDD.
     validatePrediction(model.predict(validationRDD.map(_.features)).collect(), validationData)
@@ -142,7 +143,7 @@ class SVMSuite extends FunSuite with LocalSparkContext {
     val B = -1.5
     val C = 1.0
 
-    val testData = SVMSuite.generateSVMInput(A, Array[Double](B,C), nPoints, 42)
+    val testData = SVMSuite.generateSVMInput(A, Array[Double](B, C), nPoints, 42)
 
     val initialB = -1.0
     val initialC = -1.0
@@ -156,8 +157,8 @@ class SVMSuite extends FunSuite with LocalSparkContext {
 
     val model = svm.run(testRDD, initialWeights)
 
-    val validationData = SVMSuite.generateSVMInput(A, Array[Double](B,C), nPoints, 17)
-    val validationRDD  = sc.parallelize(validationData,2)
+    val validationData = SVMSuite.generateSVMInput(A, Array[Double](B, C), nPoints, 17)
+    val validationRDD = sc.parallelize(validationData, 2)
 
     // Test prediction on RDD.
     validatePrediction(model.predict(validationRDD.map(_.features)).collect(), validationData)
@@ -174,7 +175,7 @@ class SVMSuite extends FunSuite with LocalSparkContext {
     val B = -1.5
     val C = 1.0
 
-    val testData = SVMSuite.generateSVMInput(A, Array[Double](B,C), nPoints, 42)
+    val testData = SVMSuite.generateSVMInput(A, Array[Double](B, C), nPoints, 42)
     val testRDD = sc.parallelize(testData, 2)
 
     val testRDDInvalid = testRDD.map { lp =>
@@ -191,5 +192,53 @@ class SVMSuite extends FunSuite with LocalSparkContext {
 
     // Turning off data validation should not throw an exception
     new SVMWithSGD().setValidateData(false).run(testRDDInvalid)
+  }
+
+  test("model save/load") {
+    // NOTE: This will need to be generalized once there are multiple model format versions.
+    val model = SVMSuite.binaryModel
+
+    model.clearThreshold()
+    assert(model.getThreshold.isEmpty)
+
+    val tempDir = Utils.createTempDir()
+    val path = tempDir.toURI.toString
+
+    // Save model, load it back, and compare.
+    try {
+      model.save(sc, path)
+      val sameModel = SVMModel.load(sc, path)
+      assert(model.weights == sameModel.weights)
+      assert(model.intercept == sameModel.intercept)
+      assert(sameModel.getThreshold.isEmpty)
+    } finally {
+      Utils.deleteRecursively(tempDir)
+    }
+
+    // Save model with threshold.
+    try {
+      model.setThreshold(0.7)
+      model.save(sc, path)
+      val sameModel2 = SVMModel.load(sc, path)
+      assert(model.getThreshold.get == sameModel2.getThreshold.get)
+    } finally {
+      Utils.deleteRecursively(tempDir)
+    }
+  }
+}
+
+class SVMClusterSuite extends SparkFunSuite with LocalClusterSparkContext {
+
+  test("task size should be small in both training and prediction") {
+    val m = 4
+    val n = 200000
+    val points = sc.parallelize(0 until m, 2).mapPartitionsWithIndex { (idx, iter) =>
+      val random = new Random(idx)
+      iter.map(i => LabeledPoint(1.0, Vectors.dense(Array.fill(n)(random.nextDouble()))))
+    }.cache()
+    // If we serialize data directly in the task closure, the size of the serialized task would be
+    // greater than 1MB and hence Spark would throw an error.
+    val model = SVMWithSGD.train(points, 2)
+    val predictions = model.predict(points.map(_.features))
   }
 }

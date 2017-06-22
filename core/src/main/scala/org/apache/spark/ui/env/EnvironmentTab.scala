@@ -21,13 +21,10 @@ import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.scheduler._
 import org.apache.spark.ui._
 
-private[ui] class EnvironmentTab(parent: SparkUI) extends WebUITab(parent, "environment") {
-  val appName = parent.appName
-  val basePath = parent.basePath
-  val listener = new EnvironmentListener
-
+private[ui] class EnvironmentTab(parent: SparkUI) extends SparkUITab(parent, "environment") {
+  val listener = parent.environmentListener
+  val conf = parent.conf
   attachPage(new EnvironmentPage(this))
-  parent.registerListener(listener)
 }
 
 /**
@@ -35,11 +32,17 @@ private[ui] class EnvironmentTab(parent: SparkUI) extends WebUITab(parent, "envi
  * A SparkListener that prepares information to be displayed on the EnvironmentTab
  */
 @DeveloperApi
+@deprecated("This class will be removed in a future release.", "2.2.0")
 class EnvironmentListener extends SparkListener {
+  var sparkUser: Option[String] = None
   var jvmInformation = Seq[(String, String)]()
   var sparkProperties = Seq[(String, String)]()
   var systemProperties = Seq[(String, String)]()
   var classpathEntries = Seq[(String, String)]()
+
+  override def onApplicationStart(event: SparkListenerApplicationStart): Unit = {
+    sparkUser = Some(event.sparkUser)
+  }
 
   override def onEnvironmentUpdate(environmentUpdate: SparkListenerEnvironmentUpdate) {
     synchronized {

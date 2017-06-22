@@ -20,43 +20,96 @@ PySpark is the Python API for Spark.
 
 Public classes:
 
-  - L{SparkContext<pyspark.context.SparkContext>}
+  - :class:`SparkContext`:
       Main entry point for Spark functionality.
-  - L{RDD<pyspark.rdd.RDD>}
+  - :class:`RDD`:
       A Resilient Distributed Dataset (RDD), the basic abstraction in Spark.
-  - L{Broadcast<pyspark.broadcast.Broadcast>}
+  - :class:`Broadcast`:
       A broadcast variable that gets reused across tasks.
-  - L{Accumulator<pyspark.accumulators.Accumulator>}
+  - :class:`Accumulator`:
       An "add-only" shared variable that tasks can only add values to.
-  - L{SparkConf<pyspark.conf.SparkConf>}
+  - :class:`SparkConf`:
       For configuring Spark.
-  - L{SparkFiles<pyspark.files.SparkFiles>}
+  - :class:`SparkFiles`:
       Access files shipped with jobs.
-  - L{StorageLevel<pyspark.storagelevel.StorageLevel>}
+  - :class:`StorageLevel`:
       Finer-grained cache persistence levels.
+  - :class:`TaskContext`:
+      Information about the current running task, available on the workers and experimental.
 
-Spark SQL:
-  - L{SQLContext<pyspark.sql.SQLContext>}
-      Main entry point for SQL functionality.
-  - L{SchemaRDD<pyspark.sql.SchemaRDD>}
-      A Resilient Distributed Dataset (RDD) with Schema information for the data contained. In
-      addition to normal RDD operations, SchemaRDDs also support SQL.
-  - L{Row<pyspark.sql.Row>}
-      A Row of data returned by a Spark SQL query.
-
-Hive:
-  - L{HiveContext<pyspark.context.HiveContext>}
-      Main entry point for accessing data stored in Apache Hive..
 """
+
+from functools import wraps
+import types
 
 from pyspark.conf import SparkConf
 from pyspark.context import SparkContext
-from pyspark.sql import SQLContext
 from pyspark.rdd import RDD
-from pyspark.sql import SchemaRDD
-from pyspark.sql import Row
 from pyspark.files import SparkFiles
 from pyspark.storagelevel import StorageLevel
+from pyspark.accumulators import Accumulator, AccumulatorParam
+from pyspark.broadcast import Broadcast
+from pyspark.serializers import MarshalSerializer, PickleSerializer
+from pyspark.status import *
+from pyspark.taskcontext import TaskContext
+from pyspark.profiler import Profiler, BasicProfiler
+from pyspark.version import __version__
 
 
-__all__ = ["SparkConf", "SparkContext", "SQLContext", "RDD", "SchemaRDD", "SparkFiles", "StorageLevel", "Row"]
+def since(version):
+    """
+    A decorator that annotates a function to append the version of Spark the function was added.
+    """
+    import re
+    indent_p = re.compile(r'\n( +)')
+
+    def deco(f):
+        indents = indent_p.findall(f.__doc__)
+        indent = ' ' * (min(len(m) for m in indents) if indents else 0)
+        f.__doc__ = f.__doc__.rstrip() + "\n\n%s.. versionadded:: %s" % (indent, version)
+        return f
+    return deco
+
+
+def copy_func(f, name=None, sinceversion=None, doc=None):
+    """
+    Returns a function with same code, globals, defaults, closure, and
+    name (or provide a new name).
+    """
+    # See
+    # http://stackoverflow.com/questions/6527633/how-can-i-make-a-deepcopy-of-a-function-in-python
+    fn = types.FunctionType(f.__code__, f.__globals__, name or f.__name__, f.__defaults__,
+                            f.__closure__)
+    # in case f was given attrs (note this dict is a shallow copy):
+    fn.__dict__.update(f.__dict__)
+    if doc is not None:
+        fn.__doc__ = doc
+    if sinceversion is not None:
+        fn = since(sinceversion)(fn)
+    return fn
+
+
+def keyword_only(func):
+    """
+    A decorator that forces keyword arguments in the wrapped method
+    and saves actual input keyword arguments in `_input_kwargs`.
+
+    .. note:: Should only be used to wrap a method where first arg is `self`
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if len(args) > 0:
+            raise TypeError("Method %s forces keyword arguments." % func.__name__)
+        self._input_kwargs = kwargs
+        return func(self, **kwargs)
+    return wrapper
+
+
+# for back compatibility
+from pyspark.sql import SQLContext, HiveContext, Row
+
+__all__ = [
+    "SparkConf", "SparkContext", "SparkFiles", "RDD", "StorageLevel", "Broadcast",
+    "Accumulator", "AccumulatorParam", "MarshalSerializer", "PickleSerializer",
+    "StatusTracker", "SparkJobInfo", "SparkStageInfo", "Profiler", "BasicProfiler", "TaskContext",
+]

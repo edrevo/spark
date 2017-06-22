@@ -17,70 +17,84 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import org.apache.spark.sql.catalyst.trees
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.errors.attachTree
-import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.Logging
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
+import org.apache.spark.sql.types._
 
 /**
  * A bound reference points to a specific slot in the input tuple, allowing the actual value
  * to be retrieved more efficiently.  However, since operations like column pruning can change
  * the layout of intermediate tuples, BindReferences should be run after all such transformations.
  */
-case class BoundReference(ordinal: Int, baseReference: Attribute)
-  extends Attribute with trees.LeafNode[Expression] {
+case class BoundReference(ordinal: Int, dataType: DataType, nullable: Boolean)
+  extends LeafExpression {
 
-  type EvaluatedType = Any
+  override def toString: String = s"input[$ordinal, ${dataType.simpleString}, $nullable]"
 
-  def nullable = baseReference.nullable
-  def dataType = baseReference.dataType
-  def exprId = baseReference.exprId
-  def qualifiers = baseReference.qualifiers
-  def name = baseReference.name
-
-  def newInstance = BoundReference(ordinal, baseReference.newInstance)
-  def withQualifiers(newQualifiers: Seq[String]) =
-    BoundReference(ordinal, baseReference.withQualifiers(newQualifiers))
-
-  override def toString = s"$baseReference:$ordinal"
-
-  override def eval(input: Row): Any = input(ordinal)
-}
-
-/**
- * Used to denote operators that do their own binding of attributes internally.
- */
-trait NoBind { self: trees.TreeNode[_] => }
-
-class BindReferences[TreeNode <: QueryPlan[TreeNode]] extends Rule[TreeNode] {
-  import BindReferences._
-
-  def apply(plan: TreeNode): TreeNode = {
-    plan.transform {
-      case n: NoBind => n.asInstanceOf[TreeNode]
-      case leafNode if leafNode.children.isEmpty => leafNode
-      case unaryNode if unaryNode.children.size == 1 => unaryNode.transformExpressions { case e =>
-        bindReference(e, unaryNode.children.head.output)
+  // Use special getter for primitive types (for UnsafeRow)
+  override def eval(input: InternalRow): Any = {
+    if (input.isNullAt(ordinal)) {
+      null
+    } else {
+      dataType match {
+        case BooleanType => input.getBoolean(ordinal)
+        case ByteType => input.getByte(ordinal)
+        case ShortType => input.getShort(ordinal)
+        case IntegerType | DateType => input.getInt(ordinal)
+        case LongType | TimestampType => input.getLong(ordinal)
+        case FloatType => input.getFloat(ordinal)
+        case DoubleType => input.getDouble(ordinal)
+        case StringType => input.getUTF8String(ordinal)
+        case BinaryType => input.getBinary(ordinal)
+        case CalendarIntervalType => input.getInterval(ordinal)
+        case t: DecimalType => input.getDecimal(ordinal, t.precision, t.scale)
+        case t: StructType => input.getStruct(ordinal, t.size)
+        case _: ArrayType => input.getArray(ordinal)
+        case _: MapType => input.getMap(ordinal)
+        case _ => input.get(ordinal, dataType)
       }
+    }
+  }
+
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    val javaType = ctx.javaType(dataType)
+    val value = ctx.getValue(ctx.INPUT_ROW, dataType, ordinal.toString)
+    if (ctx.currentVars != null && ctx.currentVars(ordinal) != null) {
+      val oev = ctx.currentVars(ordinal)
+      ev.isNull = oev.isNull
+      ev.value = oev.value
+      val code = oev.code
+      oev.code = ""
+      ev.copy(code = code)
+    } else if (nullable) {
+      ev.copy(code = s"""
+        boolean ${ev.isNull} = ${ctx.INPUT_ROW}.isNullAt($ordinal);
+        $javaType ${ev.value} = ${ev.isNull} ? ${ctx.defaultValue(dataType)} : ($value);""")
+    } else {
+      ev.copy(code = s"""$javaType ${ev.value} = $value;""", isNull = "false")
     }
   }
 }
 
 object BindReferences extends Logging {
-  def bindReference[A <: Expression](expression: A, input: Seq[Attribute]): A = {
+
+  def bindReference[A <: Expression](
+      expression: A,
+      input: AttributeSeq,
+      allowFailures: Boolean = false): A = {
     expression.transform { case a: AttributeReference =>
       attachTree(a, "Binding attribute") {
-        val ordinal = input.indexWhere(_.exprId == a.exprId)
+        val ordinal = input.indexOf(a.exprId)
         if (ordinal == -1) {
-          // TODO: This fallback is required because some operators (such as ScriptTransform)
-          // produce new attributes that can't be bound.  Likely the right thing to do is remove
-          // this rule and require all operators to explicitly bind to the input schema that
-          // they specify.
-          logger.debug(s"Couldn't find $a in ${input.mkString("[", ",", "]")}")
-          a
+          if (allowFailures) {
+            a
+          } else {
+            sys.error(s"Couldn't find $a in ${input.attrs.mkString("[", ",", "]")}")
+          }
         } else {
-          BoundReference(ordinal, a)
+          BoundReference(ordinal, a.dataType, input(ordinal).nullable)
         }
       }
     }.asInstanceOf[A] // Kind of a hack, but safe.  TODO: Tighten return type when possible.

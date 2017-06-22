@@ -22,17 +22,17 @@ import javax.servlet.http.HttpServletRequest
 import scala.xml.Node
 
 import org.apache.spark.ui.{UIUtils, WebUIPage}
+import org.apache.spark.util.Utils
 
 private[ui] class EnvironmentPage(parent: EnvironmentTab) extends WebUIPage("") {
-  private val appName = parent.appName
-  private val basePath = parent.basePath
   private val listener = parent.listener
 
   def render(request: HttpServletRequest): Seq[Node] = {
     val runtimeInformationTable = UIUtils.listingTable(
       propertyHeader, jvmRow, listener.jvmInformation, fixedWidth = true)
-    val sparkPropertiesTable = UIUtils.listingTable(
-      propertyHeader, propertyRow, listener.sparkProperties, fixedWidth = true)
+    val sparkPropertiesTable = UIUtils.listingTable(propertyHeader, propertyRow,
+      Utils.redact(parent.conf, listener.sparkProperties), fixedWidth = true)
+
     val systemPropertiesTable = UIUtils.listingTable(
       propertyHeader, propertyRow, listener.systemProperties, fixedWidth = true)
     val classpathEntriesTable = UIUtils.listingTable(
@@ -45,7 +45,7 @@ private[ui] class EnvironmentPage(parent: EnvironmentTab) extends WebUIPage("") 
         <h4>Classpath Entries</h4> {classpathEntriesTable}
       </span>
 
-    UIUtils.headerSparkPage(content, basePath, appName, "Environment", parent.headerTabs, parent)
+    UIUtils.headerSparkPage("Environment", content, parent)
   }
 
   private def propertyHeader = Seq("Name", "Value")

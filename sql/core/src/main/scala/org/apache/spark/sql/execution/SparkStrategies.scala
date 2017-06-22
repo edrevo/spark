@@ -17,180 +17,285 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.sql.{SQLContext, execution}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.Strategy
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.encoders.RowEncoder
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.aggregate.First
 import org.apache.spark.sql.catalyst.planning._
 import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.plans.physical._
-import org.apache.spark.sql.parquet._
-import org.apache.spark.sql.columnar.{InMemoryRelation, InMemoryColumnarTableScan}
+import org.apache.spark.sql.execution
+import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
+import org.apache.spark.sql.execution.command._
+import org.apache.spark.sql.execution.exchange.ShuffleExchange
+import org.apache.spark.sql.execution.joins.{BuildLeft, BuildRight}
+import org.apache.spark.sql.execution.streaming._
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.streaming.StreamingQuery
 
-private[sql] abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
-  self: SQLContext#SparkPlanner =>
+/**
+ * Converts a logical plan into zero or more SparkPlans.  This API is exposed for experimenting
+ * with the query planner and is not designed to be stable across spark releases.  Developers
+ * writing libraries should instead consider using the stable APIs provided in
+ * [[org.apache.spark.sql.sources]]
+ */
+abstract class SparkStrategy extends GenericStrategy[SparkPlan] {
 
-  object LeftSemiJoin extends Strategy with PredicateHelper {
-    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      // Find left semi joins where at least some predicates can be evaluated by matching hash
-      // keys using the HashFilteredJoin pattern.
-      case HashFilteredJoin(LeftSemi, leftKeys, rightKeys, condition, left, right) =>
-        val semiJoin = execution.LeftSemiJoinHash(
-          leftKeys, rightKeys, planLater(left), planLater(right))
-        condition.map(Filter(_, semiJoin)).getOrElse(semiJoin) :: Nil
-      // no predicate can be evaluated by matching hash keys
-      case logical.Join(left, right, LeftSemi, condition) =>
-        execution.LeftSemiJoinBNL(
-          planLater(left), planLater(right), condition)(sqlContext) :: Nil
+  override protected def planLater(plan: LogicalPlan): SparkPlan = PlanLater(plan)
+}
+
+case class PlanLater(plan: LogicalPlan) extends LeafExecNode {
+
+  override def output: Seq[Attribute] = plan.output
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    throw new UnsupportedOperationException()
+  }
+}
+
+abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
+  self: SparkPlanner =>
+
+  /**
+   * Plans special cases of limit operators.
+   */
+  object SpecialLimits extends Strategy {
+    override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case logical.ReturnAnswer(rootPlan) => rootPlan match {
+        case logical.Limit(IntegerLiteral(limit), logical.Sort(order, true, child)) =>
+          execution.TakeOrderedAndProjectExec(limit, order, child.output, planLater(child)) :: Nil
+        case logical.Limit(
+            IntegerLiteral(limit),
+            logical.Project(projectList, logical.Sort(order, true, child))) =>
+          execution.TakeOrderedAndProjectExec(
+            limit, order, projectList, planLater(child)) :: Nil
+        case logical.Limit(IntegerLiteral(limit), child) =>
+          execution.CollectLimitExec(limit, planLater(child)) :: Nil
+        case other => planLater(other) :: Nil
+      }
+      case logical.Limit(IntegerLiteral(limit), logical.Sort(order, true, child)) =>
+        execution.TakeOrderedAndProjectExec(limit, order, child.output, planLater(child)) :: Nil
+      case logical.Limit(
+          IntegerLiteral(limit), logical.Project(projectList, logical.Sort(order, true, child))) =>
+        execution.TakeOrderedAndProjectExec(
+          limit, order, projectList, planLater(child)) :: Nil
       case _ => Nil
     }
   }
 
-  object HashJoin extends Strategy with PredicateHelper {
-    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      // Find inner joins where at least some predicates can be evaluated by matching hash keys
-      // using the HashFilteredJoin pattern.
-      case HashFilteredJoin(Inner, leftKeys, rightKeys, condition, left, right) =>
-        val hashJoin =
-          execution.HashJoin(leftKeys, rightKeys, BuildRight, planLater(left), planLater(right))
-        condition.map(Filter(_, hashJoin)).getOrElse(hashJoin) :: Nil
-      case _ => Nil
+  /**
+   * Select the proper physical plan for join based on joining keys and size of logical plan.
+   *
+   * At first, uses the [[ExtractEquiJoinKeys]] pattern to find joins where at least some of the
+   * predicates can be evaluated by matching join keys. If found,  Join implementations are chosen
+   * with the following precedence:
+   *
+   * - Broadcast: if one side of the join has an estimated physical size that is smaller than the
+   *     user-configurable [[SQLConf.AUTO_BROADCASTJOIN_THRESHOLD]] threshold
+   *     or if that side has an explicit broadcast hint (e.g. the user applied the
+   *     [[org.apache.spark.sql.functions.broadcast()]] function to a DataFrame), then that side
+   *     of the join will be broadcasted and the other side will be streamed, with no shuffling
+   *     performed. If both sides of the join are eligible to be broadcasted then the
+   * - Shuffle hash join: if the average size of a single partition is small enough to build a hash
+   *     table.
+   * - Sort merge: if the matching join keys are sortable.
+   *
+   * If there is no joining keys, Join implementations are chosen with the following precedence:
+   * - BroadcastNestedLoopJoin: if one side of the join could be broadcasted
+   * - CartesianProduct: for Inner join
+   * - BroadcastNestedLoopJoin
+   */
+  object JoinSelection extends Strategy with PredicateHelper {
+
+    /**
+     * Matches a plan whose output should be small enough to be used in broadcast join.
+     */
+    private def canBroadcast(plan: LogicalPlan): Boolean = {
+      plan.stats(conf).hints.broadcast ||
+        (plan.stats(conf).sizeInBytes >= 0 &&
+          plan.stats(conf).sizeInBytes <= conf.autoBroadcastJoinThreshold)
     }
-  }
 
-  object PartialAggregation extends Strategy {
-    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      case logical.Aggregate(groupingExpressions, aggregateExpressions, child) =>
-        // Collect all aggregate expressions.
-        val allAggregates =
-          aggregateExpressions.flatMap(_ collect { case a: AggregateExpression => a})
-        // Collect all aggregate expressions that can be computed partially.
-        val partialAggregates =
-          aggregateExpressions.flatMap(_ collect { case p: PartialAggregate => p})
-
-        // Only do partial aggregation if supported by all aggregate expressions.
-        if (allAggregates.size == partialAggregates.size) {
-          // Create a map of expressions to their partial evaluations for all aggregate expressions.
-          val partialEvaluations: Map[Long, SplitEvaluation] =
-            partialAggregates.map(a => (a.id, a.asPartial)).toMap
-
-          // We need to pass all grouping expressions though so the grouping can happen a second
-          // time. However some of them might be unnamed so we alias them allowing them to be
-          // referenced in the second aggregation.
-          val namedGroupingExpressions: Map[Expression, NamedExpression] = groupingExpressions.map {
-            case n: NamedExpression => (n, n)
-            case other => (other, Alias(other, "PartialGroup")())
-          }.toMap
-
-          // Replace aggregations with a new expression that computes the result from the already
-          // computed partial evaluations and grouping values.
-          val rewrittenAggregateExpressions = aggregateExpressions.map(_.transformUp {
-            case e: Expression if partialEvaluations.contains(e.id) =>
-              partialEvaluations(e.id).finalEvaluation
-            case e: Expression if namedGroupingExpressions.contains(e) =>
-              namedGroupingExpressions(e).toAttribute
-          }).asInstanceOf[Seq[NamedExpression]]
-
-          val partialComputation =
-            (namedGroupingExpressions.values ++
-             partialEvaluations.values.flatMap(_.partialEvaluations)).toSeq
-
-          // Construct two phased aggregation.
-          execution.Aggregate(
-            partial = false,
-            namedGroupingExpressions.values.map(_.toAttribute).toSeq,
-            rewrittenAggregateExpressions,
-            execution.Aggregate(
-              partial = true,
-              groupingExpressions,
-              partialComputation,
-              planLater(child))(sqlContext))(sqlContext) :: Nil
-        } else {
-          Nil
-        }
-      case _ => Nil
+    /**
+     * Matches a plan whose single partition should be small enough to build a hash table.
+     *
+     * Note: this assume that the number of partition is fixed, requires additional work if it's
+     * dynamic.
+     */
+    private def canBuildLocalHashMap(plan: LogicalPlan): Boolean = {
+      plan.stats(conf).sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
     }
-  }
 
-  object BroadcastNestedLoopJoin extends Strategy {
+    /**
+     * Returns whether plan a is much smaller (3X) than plan b.
+     *
+     * The cost to build hash map is higher than sorting, we should only build hash map on a table
+     * that is much smaller than other one. Since we does not have the statistic for number of rows,
+     * use the size of bytes here as estimation.
+     */
+    private def muchSmaller(a: LogicalPlan, b: LogicalPlan): Boolean = {
+      a.stats(conf).sizeInBytes * 3 <= b.stats(conf).sizeInBytes
+    }
+
+    private def canBuildRight(joinType: JoinType): Boolean = joinType match {
+      case _: InnerLike | LeftOuter | LeftSemi | LeftAnti => true
+      case j: ExistenceJoin => true
+      case _ => false
+    }
+
+    private def canBuildLeft(joinType: JoinType): Boolean = joinType match {
+      case _: InnerLike | RightOuter => true
+      case _ => false
+    }
+
     def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+
+      // --- BroadcastHashJoin --------------------------------------------------------------------
+
+      case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+        if canBuildRight(joinType) && canBroadcast(right) =>
+        Seq(joins.BroadcastHashJoinExec(
+          leftKeys, rightKeys, joinType, BuildRight, condition, planLater(left), planLater(right)))
+
+      case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+        if canBuildLeft(joinType) && canBroadcast(left) =>
+        Seq(joins.BroadcastHashJoinExec(
+          leftKeys, rightKeys, joinType, BuildLeft, condition, planLater(left), planLater(right)))
+
+      // --- ShuffledHashJoin ---------------------------------------------------------------------
+
+      case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+         if !conf.preferSortMergeJoin && canBuildRight(joinType) && canBuildLocalHashMap(right)
+           && muchSmaller(right, left) ||
+           !RowOrdering.isOrderable(leftKeys) =>
+        Seq(joins.ShuffledHashJoinExec(
+          leftKeys, rightKeys, joinType, BuildRight, condition, planLater(left), planLater(right)))
+
+      case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+         if !conf.preferSortMergeJoin && canBuildLeft(joinType) && canBuildLocalHashMap(left)
+           && muchSmaller(left, right) ||
+           !RowOrdering.isOrderable(leftKeys) =>
+        Seq(joins.ShuffledHashJoinExec(
+          leftKeys, rightKeys, joinType, BuildLeft, condition, planLater(left), planLater(right)))
+
+      // --- SortMergeJoin ------------------------------------------------------------
+
+      case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
+        if RowOrdering.isOrderable(leftKeys) =>
+        joins.SortMergeJoinExec(
+          leftKeys, rightKeys, joinType, condition, planLater(left), planLater(right)) :: Nil
+
+      // --- Without joining keys ------------------------------------------------------------
+
+      // Pick BroadcastNestedLoopJoin if one side could be broadcasted
+      case j @ logical.Join(left, right, joinType, condition)
+          if canBuildRight(joinType) && canBroadcast(right) =>
+        joins.BroadcastNestedLoopJoinExec(
+          planLater(left), planLater(right), BuildRight, joinType, condition) :: Nil
+      case j @ logical.Join(left, right, joinType, condition)
+          if canBuildLeft(joinType) && canBroadcast(left) =>
+        joins.BroadcastNestedLoopJoinExec(
+          planLater(left), planLater(right), BuildLeft, joinType, condition) :: Nil
+
+      // Pick CartesianProduct for InnerJoin
+      case logical.Join(left, right, _: InnerLike, condition) =>
+        joins.CartesianProductExec(planLater(left), planLater(right), condition) :: Nil
+
       case logical.Join(left, right, joinType, condition) =>
-        execution.BroadcastNestedLoopJoin(
-          planLater(left), planLater(right), joinType, condition)(sqlContext) :: Nil
-      case _ => Nil
-    }
-  }
-
-  object CartesianProduct extends Strategy {
-    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      case logical.Join(left, right, _, None) =>
-        execution.CartesianProduct(planLater(left), planLater(right)) :: Nil
-      case logical.Join(left, right, Inner, Some(condition)) =>
-        execution.Filter(condition,
-          execution.CartesianProduct(planLater(left), planLater(right))) :: Nil
-      case _ => Nil
-    }
-  }
-
-  protected lazy val singleRowRdd =
-    sparkContext.parallelize(Seq(new GenericRow(Array[Any]()): Row), 1)
-
-  def convertToCatalyst(a: Any): Any = a match {
-    case s: Seq[Any] => s.map(convertToCatalyst)
-    case p: Product => new GenericRow(p.productIterator.map(convertToCatalyst).toArray)
-    case other => other
-  }
-
-  object TakeOrdered extends Strategy {
-    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      case logical.Limit(IntegerLiteral(limit), logical.Sort(order, child)) =>
-        execution.TakeOrdered(limit, order, planLater(child))(sqlContext) :: Nil
-      case _ => Nil
-    }
-  }
-
-  object ParquetOperations extends Strategy {
-    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      // TODO: need to support writing to other types of files.  Unify the below code paths.
-      case logical.WriteToFile(path, child) =>
-        val relation =
-          ParquetRelation.create(path, child, sparkContext.hadoopConfiguration)
-        // Note: overwrite=false because otherwise the metadata we just created will be deleted
-        InsertIntoParquetTable(relation, planLater(child), overwrite=false)(sqlContext) :: Nil
-      case logical.InsertIntoTable(table: ParquetRelation, partition, child, overwrite) =>
-        InsertIntoParquetTable(table, planLater(child), overwrite)(sqlContext) :: Nil
-      case PhysicalOperation(projectList, filters: Seq[Expression], relation: ParquetRelation) =>
-        val prunePushedDownFilters =
-          if (sparkContext.conf.getBoolean(ParquetFilters.PARQUET_FILTER_PUSHDOWN_ENABLED, true)) {
-            (filters: Seq[Expression]) => {
-              filters.filter { filter =>
-                // Note: filters cannot be pushed down to Parquet if they contain more complex
-                // expressions than simple "Attribute cmp Literal" comparisons. Here we remove
-                // all filters that have been pushed down. Note that a predicate such as
-                // "(A AND B) OR C" can result in "A OR C" being pushed down.
-                val recordFilter = ParquetFilters.createFilter(filter)
-                if (!recordFilter.isDefined) {
-                  // First case: the pushdown did not result in any record filter.
-                  true
-                } else {
-                  // Second case: a record filter was created; here we are conservative in
-                  // the sense that even if "A" was pushed and we check for "A AND B" we
-                  // still want to keep "A AND B" in the higher-level filter, not just "B".
-                  !ParquetFilters.findExpression(recordFilter.get, filter).isDefined
-                }
-              }
-            }
+        val buildSide =
+          if (right.stats(conf).sizeInBytes <= left.stats(conf).sizeInBytes) {
+            BuildRight
           } else {
-            identity[Seq[Expression]] _
+            BuildLeft
           }
-        pruneFilterProject(
-          projectList,
-          filters,
-          prunePushedDownFilters,
-          ParquetTableScan(_, relation, filters)(sqlContext)) :: Nil
+        // This join could be very slow or OOM
+        joins.BroadcastNestedLoopJoinExec(
+          planLater(left), planLater(right), buildSide, joinType, condition) :: Nil
+
+      // --- Cases where this strategy does not apply ---------------------------------------------
 
       case _ => Nil
     }
   }
+
+  /**
+   * Used to plan aggregation queries that are computed incrementally as part of a
+   * [[StreamingQuery]]. Currently this rule is injected into the planner
+   * on-demand, only when planning in a [[org.apache.spark.sql.execution.streaming.StreamExecution]]
+   */
+  object StatefulAggregationStrategy extends Strategy {
+    override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case EventTimeWatermark(columnName, delay, child) =>
+        EventTimeWatermarkExec(columnName, delay, planLater(child)) :: Nil
+
+      case PhysicalAggregation(
+        namedGroupingExpressions, aggregateExpressions, rewrittenResultExpressions, child) =>
+
+        aggregate.AggUtils.planStreamingAggregation(
+          namedGroupingExpressions,
+          aggregateExpressions,
+          rewrittenResultExpressions,
+          planLater(child))
+
+      case _ => Nil
+    }
+  }
+
+  /**
+   * Used to plan the streaming deduplicate operator.
+   */
+  object StreamingDeduplicationStrategy extends Strategy {
+    override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case Deduplicate(keys, child, true) =>
+        StreamingDeduplicateExec(keys, planLater(child)) :: Nil
+
+      case _ => Nil
+    }
+  }
+
+  /**
+   * Used to plan the aggregate operator for expressions based on the AggregateFunction2 interface.
+   */
+  object Aggregation extends Strategy {
+    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case PhysicalAggregation(
+          groupingExpressions, aggregateExpressions, resultExpressions, child) =>
+
+        val (functionsWithDistinct, functionsWithoutDistinct) =
+          aggregateExpressions.partition(_.isDistinct)
+        if (functionsWithDistinct.map(_.aggregateFunction.children).distinct.length > 1) {
+          // This is a sanity check. We should not reach here when we have multiple distinct
+          // column sets. Our MultipleDistinctRewriter should take care this case.
+          sys.error("You hit a query analyzer bug. Please report your query to " +
+              "Spark user mailing list.")
+        }
+
+        val aggregateOperator =
+          if (functionsWithDistinct.isEmpty) {
+            aggregate.AggUtils.planAggregateWithoutDistinct(
+              groupingExpressions,
+              aggregateExpressions,
+              resultExpressions,
+              planLater(child))
+          } else {
+            aggregate.AggUtils.planAggregateWithOneDistinct(
+              groupingExpressions,
+              functionsWithDistinct,
+              functionsWithoutDistinct,
+              resultExpressions,
+              planLater(child))
+          }
+
+        aggregateOperator
+
+      case _ => Nil
+    }
+  }
+
+  protected lazy val singleRowRdd = sparkContext.parallelize(Seq(InternalRow()), 1)
 
   object InMemoryScans extends Strategy {
     def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
@@ -198,63 +303,137 @@ private[sql] abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
         pruneFilterProject(
           projectList,
           filters,
-          identity[Seq[Expression]], // No filters are pushed down.
-          InMemoryColumnarTableScan(_, mem)) :: Nil
+          identity[Seq[Expression]], // All filters still need to be evaluated.
+          InMemoryTableScanExec(_, filters, mem)) :: Nil
       case _ => Nil
+    }
+  }
+
+  /**
+   * This strategy is just for explaining `Dataset/DataFrame` created by `spark.readStream`.
+   * It won't affect the execution, because `StreamingRelation` will be replaced with
+   * `StreamingExecutionRelation` in `StreamingQueryManager` and `StreamingExecutionRelation` will
+   * be replaced with the real relation using the `Source` in `StreamExecution`.
+   */
+  object StreamingRelationStrategy extends Strategy {
+    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case s: StreamingRelation =>
+        StreamingRelationExec(s.sourceName, s.output) :: Nil
+      case s: StreamingExecutionRelation =>
+        StreamingRelationExec(s.toString, s.output) :: Nil
+      case _ => Nil
+    }
+  }
+
+  /**
+   * Strategy to convert [[FlatMapGroupsWithState]] logical operator to physical operator
+   * in streaming plans. Conversion for batch plans is handled by [[BasicOperators]].
+   */
+  object FlatMapGroupsWithStateStrategy extends Strategy {
+    override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case FlatMapGroupsWithState(
+        func, keyDeser, valueDeser, groupAttr, dataAttr, outputAttr, stateEnc, outputMode, _,
+        timeout, child) =>
+        val execPlan = FlatMapGroupsWithStateExec(
+          func, keyDeser, valueDeser, groupAttr, dataAttr, outputAttr, None, stateEnc, outputMode,
+          timeout, batchTimestampMs = None, eventTimeWatermark = None, planLater(child))
+        execPlan :: Nil
+      case _ =>
+        Nil
     }
   }
 
   // Can we automate these 'pass through' operations?
   object BasicOperators extends Strategy {
-    def numPartitions = self.numPartitions
-
     def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+      case r: RunnableCommand => ExecutedCommandExec(r, r.children.map(planLater)) :: Nil
+
+      case MemoryPlan(sink, output) =>
+        val encoder = RowEncoder(sink.schema)
+        LocalTableScanExec(output, sink.allData.map(r => encoder.toRow(r).copy())) :: Nil
+
       case logical.Distinct(child) =>
-        execution.Aggregate(
-          partial = false, child.output, child.output, planLater(child))(sqlContext) :: Nil
-      case logical.Sort(sortExprs, child) =>
-        // This sort is a global sort. Its requiredDistribution will be an OrderedDistribution.
-        execution.Sort(sortExprs, global = true, planLater(child)):: Nil
-      case logical.SortPartitions(sortExprs, child) =>
-        // This sort only sorts tuples within a partition. Its requiredDistribution will be
-        // an UnspecifiedDistribution.
-        execution.Sort(sortExprs, global = false, planLater(child)) :: Nil
-      case logical.Project(projectList, child) =>
-        execution.Project(projectList, planLater(child)) :: Nil
-      case logical.Filter(condition, child) =>
-        execution.Filter(condition, planLater(child)) :: Nil
-      case logical.Aggregate(group, agg, child) =>
-        execution.Aggregate(partial = false, group, agg, planLater(child))(sqlContext) :: Nil
-      case logical.Sample(fraction, withReplacement, seed, child) =>
-        execution.Sample(fraction, withReplacement, seed, planLater(child)) :: Nil
-      case logical.LocalRelation(output, data) =>
-        val dataAsRdd =
-          sparkContext.parallelize(data.map(r =>
-            new GenericRow(r.productIterator.map(convertToCatalyst).toArray): Row))
-        execution.ExistingRdd(output, dataAsRdd) :: Nil
-      case logical.Limit(IntegerLiteral(limit), child) =>
-        execution.Limit(limit, planLater(child))(sqlContext) :: Nil
-      case Unions(unionChildren) =>
-        execution.Union(unionChildren.map(planLater))(sqlContext) :: Nil
-      case logical.Generate(generator, join, outer, _, child) =>
-        execution.Generate(generator, join = join, outer = outer, planLater(child)) :: Nil
-      case logical.NoRelation =>
-        execution.ExistingRdd(Nil, singleRowRdd) :: Nil
-      case logical.Repartition(expressions, child) =>
-        execution.Exchange(HashPartitioning(expressions, numPartitions), planLater(child)) :: Nil
-      case SparkLogicalPlan(existingPlan) => existingPlan :: Nil
-      case _ => Nil
-    }
-  }
+        throw new IllegalStateException(
+          "logical distinct operator should have been replaced by aggregate in the optimizer")
+      case logical.Intersect(left, right) =>
+        throw new IllegalStateException(
+          "logical intersect operator should have been replaced by semi-join in the optimizer")
+      case logical.Except(left, right) =>
+        throw new IllegalStateException(
+          "logical except operator should have been replaced by anti-join in the optimizer")
 
-  case class CommandStrategy(context: SQLContext) extends Strategy {
-    def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-      case logical.SetCommand(key, value) =>
-        Seq(execution.SetCommand(key, value, plan.output)(context))
-      case logical.ExplainCommand(logicalPlan) =>
-        Seq(execution.ExplainCommand(logicalPlan, plan.output)(context))
-      case logical.CacheCommand(tableName, cache) =>
-        Seq(execution.CacheCommand(tableName, cache)(context))
+      case logical.DeserializeToObject(deserializer, objAttr, child) =>
+        execution.DeserializeToObjectExec(deserializer, objAttr, planLater(child)) :: Nil
+      case logical.SerializeFromObject(serializer, child) =>
+        execution.SerializeFromObjectExec(serializer, planLater(child)) :: Nil
+      case logical.MapPartitions(f, objAttr, child) =>
+        execution.MapPartitionsExec(f, objAttr, planLater(child)) :: Nil
+      case logical.MapPartitionsInR(f, p, b, is, os, objAttr, child) =>
+        execution.MapPartitionsExec(
+          execution.r.MapPartitionsRWrapper(f, p, b, is, os), objAttr, planLater(child)) :: Nil
+      case logical.FlatMapGroupsInR(f, p, b, is, os, key, value, grouping, data, objAttr, child) =>
+        execution.FlatMapGroupsInRExec(f, p, b, is, os, key, value, grouping,
+          data, objAttr, planLater(child)) :: Nil
+      case logical.MapElements(f, _, _, objAttr, child) =>
+        execution.MapElementsExec(f, objAttr, planLater(child)) :: Nil
+      case logical.AppendColumns(f, _, _, in, out, child) =>
+        execution.AppendColumnsExec(f, in, out, planLater(child)) :: Nil
+      case logical.AppendColumnsWithObject(f, childSer, newSer, child) =>
+        execution.AppendColumnsWithObjectExec(f, childSer, newSer, planLater(child)) :: Nil
+      case logical.MapGroups(f, key, value, grouping, data, objAttr, child) =>
+        execution.MapGroupsExec(f, key, value, grouping, data, objAttr, planLater(child)) :: Nil
+      case logical.FlatMapGroupsWithState(
+          f, key, value, grouping, data, output, _, _, _, timeout, child) =>
+        execution.MapGroupsExec(
+          f, key, value, grouping, data, output, timeout, planLater(child)) :: Nil
+      case logical.CoGroup(f, key, lObj, rObj, lGroup, rGroup, lAttr, rAttr, oAttr, left, right) =>
+        execution.CoGroupExec(
+          f, key, lObj, rObj, lGroup, rGroup, lAttr, rAttr, oAttr,
+          planLater(left), planLater(right)) :: Nil
+
+      case logical.Repartition(numPartitions, shuffle, child) =>
+        if (shuffle) {
+          ShuffleExchange(RoundRobinPartitioning(numPartitions), planLater(child)) :: Nil
+        } else {
+          execution.CoalesceExec(numPartitions, planLater(child)) :: Nil
+        }
+      case logical.Sort(sortExprs, global, child) =>
+        execution.SortExec(sortExprs, global, planLater(child)) :: Nil
+      case logical.Project(projectList, child) =>
+        execution.ProjectExec(projectList, planLater(child)) :: Nil
+      case logical.Filter(condition, child) =>
+        execution.FilterExec(condition, planLater(child)) :: Nil
+      case f: logical.TypedFilter =>
+        execution.FilterExec(f.typedCondition(f.deserializer), planLater(f.child)) :: Nil
+      case e @ logical.Expand(_, _, child) =>
+        execution.ExpandExec(e.projections, e.output, planLater(child)) :: Nil
+      case logical.Window(windowExprs, partitionSpec, orderSpec, child) =>
+        execution.window.WindowExec(windowExprs, partitionSpec, orderSpec, planLater(child)) :: Nil
+      case logical.Sample(lb, ub, withReplacement, seed, child) =>
+        execution.SampleExec(lb, ub, withReplacement, seed, planLater(child)) :: Nil
+      case logical.LocalRelation(output, data) =>
+        LocalTableScanExec(output, data) :: Nil
+      case logical.LocalLimit(IntegerLiteral(limit), child) =>
+        execution.LocalLimitExec(limit, planLater(child)) :: Nil
+      case logical.GlobalLimit(IntegerLiteral(limit), child) =>
+        execution.GlobalLimitExec(limit, planLater(child)) :: Nil
+      case logical.Union(unionChildren) =>
+        execution.UnionExec(unionChildren.map(planLater)) :: Nil
+      case g @ logical.Generate(generator, join, outer, _, _, child) =>
+        execution.GenerateExec(
+          generator, join = join, outer = outer, g.qualifiedGeneratorOutput,
+          planLater(child)) :: Nil
+      case logical.OneRowRelation =>
+        execution.RDDScanExec(Nil, singleRowRdd, "OneRowRelation") :: Nil
+      case r: logical.Range =>
+        execution.RangeExec(r) :: Nil
+      case logical.RepartitionByExpression(expressions, child, numPartitions) =>
+        exchange.ShuffleExchange(HashPartitioning(
+          expressions, numPartitions), planLater(child)) :: Nil
+      case ExternalRDD(outputObjAttr, rdd) => ExternalRDDScanExec(outputObjAttr, rdd) :: Nil
+      case r: LogicalRDD =>
+        RDDScanExec(r.output, r.rdd, "ExistingRDD", r.outputPartitioning, r.outputOrdering) :: Nil
+      case h: ResolvedHint => planLater(h.child) :: Nil
       case _ => Nil
     }
   }

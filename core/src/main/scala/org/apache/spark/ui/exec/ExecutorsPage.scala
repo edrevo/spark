@@ -21,121 +21,134 @@ import javax.servlet.http.HttpServletRequest
 
 import scala.xml.Node
 
-import org.apache.spark.ui.{WebUIPage, UIUtils}
-import org.apache.spark.util.Utils
+import org.apache.spark.status.api.v1.{ExecutorSummary, MemoryMetrics}
+import org.apache.spark.ui.{UIUtils, WebUIPage}
 
-private[ui] class ExecutorsPage(parent: ExecutorsTab) extends WebUIPage("") {
-  private val appName = parent.appName
-  private val basePath = parent.basePath
-  private val listener = parent.listener
+// This isn't even used anymore -- but we need to keep it b/c of a MiMa false positive
+private[ui] case class ExecutorSummaryInfo(
+    id: String,
+    hostPort: String,
+    rddBlocks: Int,
+    memoryUsed: Long,
+    diskUsed: Long,
+    activeTasks: Int,
+    failedTasks: Int,
+    completedTasks: Int,
+    totalTasks: Int,
+    totalDuration: Long,
+    totalInputBytes: Long,
+    totalShuffleRead: Long,
+    totalShuffleWrite: Long,
+    isBlacklisted: Int,
+    maxOnHeapMem: Long,
+    maxOffHeapMem: Long,
+    executorLogs: Map[String, String])
+
+
+private[ui] class ExecutorsPage(
+    parent: ExecutorsTab,
+    threadDumpEnabled: Boolean)
+  extends WebUIPage("") {
 
   def render(request: HttpServletRequest): Seq[Node] = {
-    val storageStatusList = listener.storageStatusList
-    val maxMem = storageStatusList.map(_.maxMem).fold(0L)(_ + _)
-    val memUsed = storageStatusList.map(_.memUsed).fold(0L)(_ + _)
-    val diskSpaceUsed = storageStatusList.flatMap(_.blocks.values.map(_.diskSize)).fold(0L)(_ + _)
-    val execInfo = for (statusId <- 0 until storageStatusList.size) yield getExecInfo(statusId)
-    val execInfoSorted = execInfo.sortBy(_.getOrElse("Executor ID", ""))
-    val execTable = UIUtils.listingTable(execHeader, execRow, execInfoSorted)
-
     val content =
-      <div class="row-fluid">
-        <div class="span12">
-          <ul class="unstyled">
-            <li><strong>Memory:</strong>
-              {Utils.bytesToString(memUsed)} Used
-              ({Utils.bytesToString(maxMem)} Total) </li>
-            <li><strong>Disk:</strong> {Utils.bytesToString(diskSpaceUsed)} Used </li>
-          </ul>
-        </div>
+      <div>
+        {
+          <div>
+            <span class="expand-additional-metrics">
+              <span class="expand-additional-metrics-arrow arrow-closed"></span>
+              <a>Show Additional Metrics</a>
+            </span>
+            <div class="additional-metrics collapsed">
+              <ul>
+                <li>
+                  <input type="checkbox" id="select-all-metrics"/>
+                  <span class="additional-metric-title"><em>(De)select All</em></span>
+                </li>
+                <li>
+                  <span data-toggle="tooltip"
+                        title={ExecutorsPage.ON_HEAP_MEMORY_TOOLTIP} data-placement="right">
+                    <input type="checkbox" name="on_heap_memory"/>
+                    <span class="additional-metric-title">On Heap Storage Memory</span>
+                  </span>
+                </li>
+                <li>
+                  <span data-toggle="tooltip"
+                        title={ExecutorsPage.OFF_HEAP_MEMORY_TOOLTIP} data-placement="right">
+                    <input type="checkbox" name="off_heap_memory"/>
+                    <span class="additional-metric-title">Off Heap Storage Memory</span>
+                  </span>
+                </li>
+              </ul>
+            </div>
+          </div> ++
+          <div id="active-executors" class="span12 pagination"></div> ++
+          <script src={UIUtils.prependBaseUri("/static/utils.js")}></script> ++
+          <script src={UIUtils.prependBaseUri("/static/executorspage.js")}></script> ++
+          <script>setThreadDumpEnabled({threadDumpEnabled})</script>
+        }
       </div>
-      <div class = "row">
-        <div class="span12">
-          {execTable}
-        </div>
-      </div>;
 
-    UIUtils.headerSparkPage(content, basePath, appName, "Executors (" + execInfo.size + ")",
-      parent.headerTabs, parent)
+    UIUtils.headerSparkPage("Executors", content, parent, useDataTables = true)
   }
+}
 
-  /** Header fields for the executors table */
-  private def execHeader = Seq(
-    "Executor ID",
-    "Address",
-    "RDD Blocks",
-    "Memory Used",
-    "Disk Used",
-    "Active Tasks",
-    "Failed Tasks",
-    "Complete Tasks",
-    "Total Tasks",
-    "Task Time",
-    "Shuffle Read",
-    "Shuffle Write")
-
-  /** Render an HTML row representing an executor */
-  private def execRow(values: Map[String, String]): Seq[Node] = {
-    val maximumMemory = values("Maximum Memory")
-    val memoryUsed = values("Memory Used")
-    val diskUsed = values("Disk Used")
-    <tr>
-      <td>{values("Executor ID")}</td>
-      <td>{values("Address")}</td>
-      <td>{values("RDD Blocks")}</td>
-      <td sorttable_customkey={memoryUsed}>
-        {Utils.bytesToString(memoryUsed.toLong)} /
-        {Utils.bytesToString(maximumMemory.toLong)}
-      </td>
-      <td sorttable_customkey={diskUsed}>
-        {Utils.bytesToString(diskUsed.toLong)}
-      </td>
-      <td>{values("Active Tasks")}</td>
-      <td>{values("Failed Tasks")}</td>
-      <td>{values("Complete Tasks")}</td>
-      <td>{values("Total Tasks")}</td>
-      <td>{Utils.msDurationToString(values("Task Time").toLong)}</td>
-      <td>{Utils.bytesToString(values("Shuffle Read").toLong)}</td>
-      <td>{Utils.bytesToString(values("Shuffle Write").toLong)}</td>
-    </tr>
-  }
+private[spark] object ExecutorsPage {
+  private val ON_HEAP_MEMORY_TOOLTIP = "Memory used / total available memory for on heap " +
+    "storage of data like RDD partitions cached in memory."
+  private val OFF_HEAP_MEMORY_TOOLTIP = "Memory used / total available memory for off heap " +
+    "storage of data like RDD partitions cached in memory."
 
   /** Represent an executor's info as a map given a storage status index */
-  private def getExecInfo(statusId: Int): Map[String, String] = {
-    val status = listener.storageStatusList(statusId)
+  def getExecInfo(
+      listener: ExecutorsListener,
+      statusId: Int,
+      isActive: Boolean): ExecutorSummary = {
+    val status = if (isActive) {
+      listener.activeStorageStatusList(statusId)
+    } else {
+      listener.deadStorageStatusList(statusId)
+    }
     val execId = status.blockManagerId.executorId
     val hostPort = status.blockManagerId.hostPort
-    val rddBlocks = status.blocks.size
+    val rddBlocks = status.numBlocks
     val memUsed = status.memUsed
     val maxMem = status.maxMem
+    val memoryMetrics = for {
+      onHeapUsed <- status.onHeapMemUsed
+      offHeapUsed <- status.offHeapMemUsed
+      maxOnHeap <- status.maxOnHeapMem
+      maxOffHeap <- status.maxOffHeapMem
+    } yield {
+      new MemoryMetrics(onHeapUsed, offHeapUsed, maxOnHeap, maxOffHeap)
+    }
+
+
     val diskUsed = status.diskUsed
-    val activeTasks = listener.executorToTasksActive.getOrElse(execId, 0)
-    val failedTasks = listener.executorToTasksFailed.getOrElse(execId, 0)
-    val completedTasks = listener.executorToTasksComplete.getOrElse(execId, 0)
-    val totalTasks = activeTasks + failedTasks + completedTasks
-    val totalDuration = listener.executorToDuration.getOrElse(execId, 0)
-    val totalShuffleRead = listener.executorToShuffleRead.getOrElse(execId, 0)
-    val totalShuffleWrite = listener.executorToShuffleWrite.getOrElse(execId, 0)
+    val taskSummary = listener.executorToTaskSummary.getOrElse(execId, ExecutorTaskSummary(execId))
 
-    // Also include fields not in the header
-    val execFields = execHeader ++ Seq("Maximum Memory")
-
-    val execValues = Seq(
+    new ExecutorSummary(
       execId,
       hostPort,
+      isActive,
       rddBlocks,
       memUsed,
       diskUsed,
-      activeTasks,
-      failedTasks,
-      completedTasks,
-      totalTasks,
-      totalDuration,
-      totalShuffleRead,
-      totalShuffleWrite,
-      maxMem
-    ).map(_.toString)
-
-    execFields.zip(execValues).toMap
+      taskSummary.totalCores,
+      taskSummary.tasksMax,
+      taskSummary.tasksActive,
+      taskSummary.tasksFailed,
+      taskSummary.tasksComplete,
+      taskSummary.tasksActive + taskSummary.tasksFailed + taskSummary.tasksComplete,
+      taskSummary.duration,
+      taskSummary.jvmGCTime,
+      taskSummary.inputBytes,
+      taskSummary.shuffleRead,
+      taskSummary.shuffleWrite,
+      taskSummary.isBlacklisted,
+      maxMem,
+      taskSummary.executorLogs,
+      memoryMetrics
+    )
   }
 }
