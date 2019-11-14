@@ -49,7 +49,7 @@ public interface StreamingWrite {
    * If this method fails (by throwing an exception), the action will fail and no Spark job will be
    * submitted.
    */
-  StreamingDataWriterFactory createStreamingWriterFactory();
+  StreamingDataWriterFactory createStreamingWriterFactory(int numPartitions);
 
   /**
    * Commits this writing job for the specified epoch with a list of commit messages. The commit

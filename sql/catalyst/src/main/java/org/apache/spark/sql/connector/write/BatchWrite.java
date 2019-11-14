@@ -46,7 +46,7 @@ public interface BatchWrite {
    * If this method fails (by throwing an exception), the action will fail and no Spark job will be
    * submitted.
    */
-  DataWriterFactory createBatchWriterFactory();
+  DataWriterFactory createBatchWriterFactory(int numPartitions);
 
   /**
    * Returns whether Spark should use the commit coordinator to ensure that at most one task for

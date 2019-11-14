@@ -120,12 +120,6 @@ class InMemoryTable(
         this
       }
 
-      override def withNumPartitions(numPartitions: Int): WriteBuilder = {
-        assert(!numPartitionsProvided, "numPartitions provided twice")
-        numPartitionsProvided = true
-        this
-      }
-
       override def withQueryId(queryId: String): WriteBuilder = {
         assert(!queryIdProvided, "queryId provided twice")
         queryIdProvided = true
@@ -154,7 +148,7 @@ class InMemoryTable(
   }
 
   private abstract class TestBatchWrite extends BatchWrite {
-    override def createBatchWriterFactory(): DataWriterFactory = {
+    override def createBatchWriterFactory(numPartitions: Int): DataWriterFactory = {
       BufferedRowsWriterFactory
     }
 
